@@ -1,0 +1,120 @@
+/* src/styles/karaoke.css */
+
+.karaoke-root {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  background: #000;
+  border-radius: 12px;
+  overflow: hidden;
+}
+
+.karaoke-player {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  z-index: 0;
+}
+
+/* Force the react-youtube inner wrapper and iframe to fill the container */
+.karaoke-player > div,
+.karaoke-player iframe {
+  width: 100% !important;
+  height: 100% !important;
+}
+
+/* Gradient fade at bottom — text sits on top of this */
+.karaoke-overlay {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  padding: 48px 20px 20px;
+  background: linear-gradient(transparent, rgba(0,0,0,0.85));
+  pointer-events: none;   /* don't block video controls */
+  text-align: center;
+  z-index: 10;            /* must be above the iframe stacking context */
+}
+
+.karaoke-prev-line {
+  font-size: 14px;
+  color: rgba(255, 255, 255, 0.35);
+  margin: 0 0 6px;
+  min-height: 20px;
+  letter-spacing: 0.02em;
+  animation: karaoke-line-fade-in 0.5s ease-out;
+}
+
+@keyframes karaoke-line-fade-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.karaoke-curr-line {
+  font-size: 26px;
+  font-weight: 500;
+  margin: 0;
+  min-height: 40px;
+  line-height: 1.4;
+  letter-spacing: 0.01em;
+}
+
+/* Word states */
+.karaoke-word {
+  display: inline;
+  padding: 0 2px;
+  border-radius: 4px;
+  transition: color 0.1s ease-out,
+              text-shadow 0.15s ease-out,
+              background-color 0.1s ease-out,
+              transform 0.1s ease-out,
+              filter 0.15s ease-out;
+  will-change: color, text-shadow;
+}
+
+.karaoke-word--upcoming {
+  color: rgba(255, 255, 255, 0.3);
+  text-shadow: none;
+}
+
+.karaoke-word--active {
+  color: #FFE066;
+  text-shadow:
+    0 0 8px rgba(255, 224, 102, 0.7),
+    0 0 20px rgba(255, 224, 102, 0.35);
+  animation: karaoke-glow 0.25s ease-out;
+}
+
+.karaoke-word--sung {
+  color: rgba(255, 255, 255, 0.8);
+  text-shadow: none;
+}
+
+/* Glow-in animation when a word becomes active */
+@keyframes karaoke-glow {
+  0% {
+    color: rgba(255, 255, 255, 0.3);
+    text-shadow: none;
+    transform: scale(1);
+  }
+  50% {
+    color: #FFF8B8;
+    text-shadow:
+      0 0 14px rgba(255, 224, 102, 0.9),
+      0 0 30px rgba(255, 224, 102, 0.5);
+    transform: scale(1.06);
+  }
+  100% {
+    color: #FFE066;
+    text-shadow:
+      0 0 8px rgba(255, 224, 102, 0.7),
+      0 0 20px rgba(255, 224, 102, 0.35);
+    transform: scale(1);
+  }
+}
+
+/* Responsive: bigger text on large screens */
+@media (min-width: 768px) {
+  .karaoke-curr-line { font-size: 32px; }
+  .karaoke-prev-line { font-size: 16px; }
+}
