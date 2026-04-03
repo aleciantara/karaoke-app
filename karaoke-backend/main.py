@@ -32,7 +32,7 @@ _whisper_model = None
 _align_models: dict = {}
 _video_locks: dict[str, asyncio.Lock] = {}
 _progress: dict[str, dict] = {}
-_SYNC_ALGO = "v5"   # bump to invalidate cached timestamps when algorithm changes
+_SYNC_ALGO = "v7"   # bump to invalidate cached timestamps when algorithm changes
 
 
 def _set_progress(video_id: str, message: str) -> None:
@@ -52,7 +52,8 @@ def _get_whisper_model(device: str, compute_type: str):
         import whisperx
         print(f"[whisperx] Loading transcription model (device={device})â€¦")
         _whisper_model = whisperx.load_model(
-            "base", device, compute_type=compute_type,
+            "small",   # ← change from "base"
+            device, compute_type=compute_type,
             download_root=os.path.join(os.path.dirname(__file__), "models"),
         )
         print("[whisperx] Model ready.")
@@ -461,27 +462,20 @@ def _assign_lines_to_vocal_windows(
 
 def _force_align_user_lyrics(
     lyrics: str,
-    audio,                  # numpy array 16 kHz
+    audio,
     trans_segs: list[dict],
     align_model,
     align_metadata,
     device: str,
     audio_duration: float,
 ) -> list[dict]:
-    """
-    Improved 4-stage pipeline:
-    1. Get WORD-LEVEL timestamps from whisperx transcription (not just segments)
-    2. Build tight per-line windows from those word timestamps
-    3. Run CTC phoneme alignment within each tight window
-    4. Interpolate any gaps, enforce monotonic
-    """
     import whisperx
 
     user_lines = [l.strip() for l in lyrics.splitlines() if l.strip()]
     if not user_lines:
         return []
 
-    # Stage 1: Get word-level timestamps from the transcription
+    # Stage 1: Word-level timestamps from transcription
     print(f"[align] Getting word-level timestamps from transcription...")
     try:
         aligned_trans = whisperx.align(
@@ -491,24 +485,28 @@ def _force_align_user_lyrics(
         trans_words = _get_trans_word_list(aligned_trans.get("segments", []))
         print(f"[align] Got {len(trans_words)} transcription word timestamps")
     except Exception as e:
-        print(f"[align] Transcription alignment failed: {e}, using segment boundaries")
+        print(f"[align] Transcription alignment failed: {e}")
         trans_words = []
 
-    # Stage 2: Build tight line windows using trans word timestamps
     vocal_regions = _find_vocal_regions(trans_segs, audio_duration, merge_gap=2.0)
+
+    vocal_regions = _find_vocal_regions(trans_segs, audio_duration, merge_gap=2.0)
+    print(f"[align] {len(vocal_regions)} vocal regions detected:")
+    for i, (s, e) in enumerate(vocal_regions):
+        print(f"  region {i+1}: {s:.1f}s → {e:.1f}s ({e-s:.1f}s)")
+
+    # Stage 2: Try CTC alignment first, but collect per-line success/fail
     line_windows = _build_tight_line_windows(
         user_lines, trans_words, vocal_regions, audio_duration
     )
 
-    # Stage 3: CTC phoneme alignment per line in its tight window
     synthetic = []
     for li, line_text in enumerate(user_lines):
         ws, we = line_windows[li]
-        # Tight pad — only 0.2s so we don't bleed into adjacent lines
-        prev_end = line_windows[li - 1][1] if li > 0 else 0.0
-        next_start = line_windows[li + 1][0] if li + 1 < len(line_windows) else audio_duration
-        seg_start = max(prev_end + 0.05, ws - 0.2)
-        seg_end   = min(next_start - 0.05, we + 0.2)
+        prev_end   = line_windows[li-1][1] if li > 0 else 0.0
+        next_start = line_windows[li+1][0] if li+1 < len(line_windows) else audio_duration
+        seg_start  = max(prev_end + 0.05, ws - 0.2)
+        seg_end    = min(next_start - 0.05, we + 0.2)
         if seg_end - seg_start < 0.8:
             mid = (ws + we) / 2
             seg_start = max(prev_end + 0.05, mid - 0.4)
@@ -523,45 +521,154 @@ def _force_align_user_lyrics(
         )
         aligned_segs = aligned.get("segments", [])
     except Exception as exc:
-        import traceback
-        print(f"[align] CTC alignment error: {exc} — using window interpolation")
-        traceback.print_exc()
+        print(f"[align] CTC alignment failed entirely: {exc}")
         aligned_segs = []
 
-    # Stage 4: Extract, interpolate, enforce monotonic
+    # Stage 3: Per-line result — use CTC if it worked, else anchor-interpolation
     result: list[dict] = []
+    ctc_success = 0
+    anchor_fallback = 0
+
     for li, line_text in enumerate(user_lines):
         ws, we = line_windows[li]
+
+        # Try CTC result first
         seg_result = []
         if li < len(aligned_segs):
-            seg_result = _interpolate_segment(
-                aligned_segs[li].get("words", []), ws, we, li
+            seg_words = aligned_segs[li].get("words", [])
+            # Trust CTC only if 80%+ of words have timestamps AND
+            # the timestamps are within the expected window (not drifted)
+            timestamped = sum(1 for w in seg_words if "start" in w and "end" in w)
+            ratio = timestamped / len(seg_words) if seg_words else 0
+
+            # Check timestamps haven't drifted wildly outside the window
+            in_window = sum(
+                1 for w in seg_words
+                if "start" in w and ws - 1.0 <= w["start"] <= we + 1.0
             )
+            window_ratio = in_window / max(1, timestamped)
+
+            if seg_words and ratio >= 0.8 and window_ratio >= 0.7:
+                seg_result = _interpolate_segment(seg_words, ws, we, li)
+                ctc_success += 1
+            else:
+                print(f"[align] Line {li} CTC weak "
+                    f"(timestamp ratio={ratio:.2f}, in-window={window_ratio:.2f}), "
+                    f"using anchor fallback")
+
         if seg_result:
             result.extend(seg_result)
+            continue
+
+        # CTC failed for this line — use anchor-based interpolation instead
+        # Find the closest transcription words in this time window as anchors
+        anchor_fallback += 1
+        line_trans_words = [
+            w for w in trans_words
+            if w["start"] >= ws - 0.5 and w["end"] <= we + 0.5
+        ]
+
+        words_in_line = re.findall(r"[\w''\u2019\-]+", line_text)
+        if not words_in_line:
+            continue
+
+        if line_trans_words:
+            # Snap lyric words to the transcription word positions in this window
+            result.extend(_snap_lyrics_to_anchors(
+                words_in_line, li, line_trans_words, ws, we
+            ))
         else:
-            # Fallback: distribute within the tight window
-            words_in_line = re.findall(r"[\w''\u2019\-]+", line_text)
-            if not words_in_line:
-                continue
+            # No anchors at all — pure even distribution within window
             step = max(0.15, (we - ws) / len(words_in_line))
             for wi, word in enumerate(words_in_line):
                 result.append({
                     "word":  word,
                     "start": round((ws + wi * step) * 1000),
-                    "end":   round(min((ws + (wi + 1) * step), we) * 1000),
+                    "end":   round(min(ws + (wi+1)*step, we) * 1000),
                     "line":  li,
                 })
+
+    print(f"[align] Results: {ctc_success} lines CTC-aligned, "
+          f"{anchor_fallback} lines anchor-interpolated.")
 
     # Enforce monotonic + minimum word duration
     MIN_MS = 120
     for i in range(1, len(result)):
-        if result[i]["start"] <= result[i - 1]["start"]:
-            result[i]["start"] = result[i - 1]["end"] + 20
+        if result[i]["start"] <= result[i-1]["start"]:
+            result[i]["start"] = result[i-1]["end"] + 20
         result[i]["end"] = max(result[i]["end"], result[i]["start"] + MIN_MS)
 
-    n_aligned = sum(1 for r in result if r["end"] - r["start"] > MIN_MS)
-    print(f"[align] Force-aligned {len(result)} words ({n_aligned} with audio timestamps).")
+    n_real = sum(1 for r in result if r["end"] - r["start"] > MIN_MS)
+    print(f"[align] Force-aligned {len(result)} words ({n_real} with real timestamps).")
+    return result
+
+def _snap_lyrics_to_anchors(
+    lyric_words: list[str],
+    line_idx: int,
+    anchor_words: list[dict],   # trans words in this window, with start/end in seconds
+    window_start: float,
+    window_end: float,
+) -> list[dict]:
+    """
+    When CTC fails, snap lyric words to nearby transcription word timestamps.
+    Uses SequenceMatcher to find matching words, interpolates the rest.
+    Produces much better timing than pure even distribution.
+    """
+    lyric_norm  = [_normalize(w) for w in lyric_words]
+    anchor_norm = [_normalize(w["word"]) for w in anchor_words]
+
+    sm = SequenceMatcher(None, lyric_norm, anchor_norm, autojunk=False)
+    assignments: dict[int, tuple[float, float]] = {}
+
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            for k in range(i2 - i1):
+                aw = anchor_words[j1 + k]
+                assignments[i1 + k] = (aw["start"], aw["end"])
+        elif tag == "replace":
+            t0  = anchor_words[j1]["start"]
+            t1  = anchor_words[j2-1]["end"]
+            n_u = i2 - i1
+            stp = (t1 - t0) / max(1, n_u)
+            for k in range(n_u):
+                assignments[i1+k] = (t0 + k*stp, t0 + (k+1)*stp)
+
+    # Build anchor list for interpolating unmatched words
+    anchors = sorted((ui, s, e) for ui, (s, e) in assignments.items())
+    result  = []
+
+    for ui, word in enumerate(lyric_words):
+        if ui in assignments:
+            s, e = assignments[ui]
+        else:
+            prev_a = next(((a,s,e) for a,s,e in reversed(anchors) if a < ui), None)
+            next_a = next(((a,s,e) for a,s,e in anchors if a > ui), None)
+            if prev_a and next_a:
+                gap  = next_a[1] - prev_a[2]
+                span = max(1, next_a[0] - prev_a[0])
+                stp  = gap / span
+                s    = prev_a[2] + (ui - prev_a[0]) * stp
+                e    = s + stp
+            elif prev_a:
+                s = prev_a[2] + 0.15 * (ui - prev_a[0])
+                e = s + 0.15
+            elif next_a:
+                s = max(window_start, next_a[1] - 0.15 * (next_a[0] - ui))
+                e = s + 0.15
+            else:
+                # No anchors at all — even distribution
+                n   = len(lyric_words)
+                dur = (window_end - window_start) / max(1, n)
+                s   = window_start + ui * dur
+                e   = s + dur
+
+        result.append({
+            "word":  word,
+            "start": round(max(0, s) * 1000),
+            "end":   round(max(0, e) * 1000),
+            "line":  line_idx,
+        })
+
     return result
 
 
